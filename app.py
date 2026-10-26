@@ -165,6 +165,7 @@ if st.button("Ask Groq AI"):
 
         except Exception as error:
             st.error(f"AI request failed: {error}")
+st.write(response.text if "response" in locals() else "No response received.")
 #6.spring simulation
 st.subheader("6. Spring Simulation")
 
