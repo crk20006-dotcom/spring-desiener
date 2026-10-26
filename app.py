@@ -127,39 +127,44 @@ question = st.text_area(
     placeholder="Example: Explain Hooke's law and give an example."
 )
 
-if st.button("Ask Local AI"):
+if st.button("Ask Groq AI"):
     if not question.strip():
         st.warning("Please enter a question first.")
     else:
         try:
+            api_key = st.secrets["GROQ_API_KEY"]
+
             response = requests.post(
-                "http://localhost:11434/api/generate",
-                json={
-                    "model": "qwen2.5-coder:7b",
-                    "prompt": (
-                        "You are a helpful mechanical engineering tutor. "
-                        "Explain concepts clearly, show equations where useful, "
-                        "and mention when engineering calculations need verification.\n\n"
-                        + question
-                    ),
-                    "stream": False,
-                    "keep-alive": "15m",
-                    "options": {
-                        "num_predict": 180,
-                        "num_ctx": 2048
-                 }
+                "https://api.groq.com/openai/v1/chat/completions",
+                headers={
+                    "Authorization": f"Bearer {api_key}",
+                    "Content-Type": "application/json",
                 },
-                timeout=180
+                json={
+                    "model": "llama-3.3-70b-versatile",
+                    "messages": [
+                        {
+                            "role": "system",
+                            "content": (
+                                "You are a helpful mechanical engineering tutor. "
+                                "Explain concepts clearly, show equations where useful, "
+                                "and mention when engineering calculations need verification."
+                            ),
+                        },
+                        {"role": "user", "content": question},
+                    ],
+                    "temperature": 0.3,
+                },
+                timeout=60,
             )
+
             response.raise_for_status()
-            answer = response.json().get("response", "")
-            st.markdown("### Local AI Answer")
+            answer = response.json()["choices"][0]["message"]["content"]
+            st.markdown("### Groq AI Answer")
             st.write(answer)
+
         except Exception as error:
-            st.error(
-                "Could not connect to Ollama. Check that Ollama is running. "
-                f"Details: {error}"
-            )
+            st.error(f"AI request failed: {error}")
 #6.spring simulation
 st.subheader("6. Spring Simulation")
 
