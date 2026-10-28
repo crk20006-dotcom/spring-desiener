@@ -174,17 +174,23 @@ fig_graph.add_trace(
     )
 )
 fig_graph.update_layout(
-    title="Spring Response at the Selected Load",
+    title=dict(text="Load–Deflection Curve", x=0.02, xanchor="left", font=dict(size=18)),
     xaxis_title="Deflection (mm)",
     yaxis_title="Load (N)",
     hovermode="closest",
-    legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="left", x=0),
-    margin=dict(l=20, r=20, t=80, b=20),
-    height=480,
+    # Put the legend below the plot so it doesn't overlap the title on phones.
+    legend=dict(orientation="h", yanchor="top", y=-0.24, xanchor="left", x=0),
+    margin=dict(l=12, r=12, t=55, b=90),
+    height=440,
+    autosize=True,
 )
-fig_graph.update_xaxes(showgrid=True, zeroline=True)
-fig_graph.update_yaxes(showgrid=True, zeroline=True)
-st.plotly_chart(fig_graph, use_container_width=True)
+fig_graph.update_xaxes(showgrid=True, zeroline=True, automargin=True, rangemode="tozero")
+fig_graph.update_yaxes(showgrid=True, zeroline=True, automargin=True, rangemode="tozero")
+st.plotly_chart(
+    fig_graph,
+    use_container_width=True,
+    config={"responsive": True, "displaylogo": False, "modeBarButtonsToRemove": ["lasso2d", "select2d"]},
+)
 
 g1, g2, g3 = st.columns(3)
 g1.metric("Selected load", f"{load:.2f} N")
@@ -208,6 +214,7 @@ st.write(
     "3D view and use the controls to zoom. This is a geometry-based visualization "
     "driven by the ideal spring calculation, not a finite-element simulation."
 )
+st.caption("The simulation load is independent of the applied load used in the main calculation and graph.")
 
 sim_load = st.slider(
     "Simulation load (N)",
@@ -260,19 +267,26 @@ for z_end, label in [(0.0, "Lower reference"), (sim_length_mm, "Upper reference"
     )
 
 fig_3d.update_layout(
-    title=f"Helical Spring — simulated load {sim_load:.1f} N",
+    title=dict(text=f"3D Spring · {sim_load:.1f} N", x=0.02, xanchor="left", font=dict(size=18)),
     scene=dict(
         xaxis_title="X (mm)",
         yaxis_title="Y (mm)",
         zaxis_title="Height (mm)",
-        aspectmode="data",
-        camera=dict(eye=dict(x=1.6, y=1.6, z=1.2)),
+        # Avoid data-based scaling flattening the height axis when the spring is short.
+        aspectmode="manual",
+        aspectratio=dict(x=1, y=1, z=1.8),
+        camera=dict(eye=dict(x=1.7, y=1.7, z=1.25), up=dict(x=0, y=0, z=1)),
     ),
-    margin=dict(l=0, r=0, t=60, b=0),
-    height=600,
-    legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="left", x=0),
+    margin=dict(l=4, r=4, t=55, b=8),
+    height=520,
+    autosize=True,
+    showlegend=False,
 )
-st.plotly_chart(fig_3d, use_container_width=True)
+st.plotly_chart(
+    fig_3d,
+    use_container_width=True,
+    config={"responsive": True, "displaylogo": False},
+)
 
 s1, s2, s3 = st.columns(3)
 s1.metric("Simulation load", f"{sim_load:.1f} N")
