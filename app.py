@@ -10,6 +10,9 @@ from typing import Iterable
 import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
 import requests
 import streamlit as st
 
@@ -81,57 +84,59 @@ def chart_layout(fig: go.Figure, height: int = 420) -> go.Figure:
     return fig
 
 
-def _make_pdf(title: str, lines: Iterable[str]) -> bytes | None:
-    """Create a compact PDF report when ReportLab is installed; otherwise return None."""
+def _make_pdf(title: str, lines: Iterable[str], graph_png: bytes | None = None) -> bytes | None:
+    """Build a detailed PDF report, optionally embedding the selected output graph."""
     try:
         from reportlab.lib import colors
         from reportlab.lib.enums import TA_LEFT
         from reportlab.lib.pagesizes import letter
         from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
         from reportlab.lib.units import inch
-        from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer
+        from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Image, KeepTogether
 
         output = io.BytesIO()
         doc = SimpleDocTemplate(
             output, pagesize=letter,
-            rightMargin=0.65 * inch, leftMargin=0.65 * inch,
-            topMargin=0.65 * inch, bottomMargin=0.65 * inch,
+            rightMargin=0.55 * inch, leftMargin=0.55 * inch,
+            topMargin=0.55 * inch, bottomMargin=0.55 * inch,
         )
         styles = getSampleStyleSheet()
         styles.add(ParagraphStyle(name="ReportBody", parent=styles["BodyText"], alignment=TA_LEFT,
-                                  leading=15, spaceAfter=7, textColor=colors.HexColor("#243244")))
-        story = [Paragraph(title, styles["Title"]), Spacer(1, 12)]
+                                  leading=14, spaceAfter=6, textColor=colors.HexColor("#243244")))
+        styles.add(ParagraphStyle(name="ReportSection", parent=styles["Heading2"],
+                                  textColor=colors.HexColor("#176B87"), spaceBefore=10, spaceAfter=6))
+        story = [Paragraph(title, styles["Title"]), Spacer(1, 8)]
         for line in lines:
             safe = (str(line).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;"))
-            story.append(Paragraph(safe, styles["ReportBody"]))
+            if safe.startswith("SECTION: "):
+                story.append(Paragraph(safe[len("SECTION: "):], styles["ReportSection"]))
+            else:
+                story.append(Paragraph(safe, styles["ReportBody"]))
+        if graph_png:
+            story.append(Paragraph("Selected output graph", styles["ReportSection"]))
+            graph = Image(io.BytesIO(graph_png), width=7.1 * inch, height=3.75 * inch, kind="proportional")
+            story.append(KeepTogether([graph, Spacer(1, 8)]))
         doc.build(story)
         return output.getvalue()
     except ImportError:
         return None
 
 
-def downloads(filename: str, df: pd.DataFrame, report_title: str, report_lines: list[str]) -> None:
-    left, right = st.columns(2)
-    with left:
+def downloads(filename: str, report_title: str, report_lines: list[str], graph_png: bytes | None = None) -> None:
+    pdf_bytes = _make_pdf(report_title, report_lines, graph_png)
+    if pdf_bytes:
         st.download_button(
-            "⬇️ Download CSV data", data=df.to_csv(index=False).encode("utf-8"),
-            file_name=f"{filename}.csv", mime="text/csv", use_container_width=True,
+            "⬇️ Download complete PDF report", data=pdf_bytes,
+            file_name=f"{filename}_report.pdf", mime="application/pdf", use_container_width=True,
         )
-    pdf_bytes = _make_pdf(report_title, report_lines)
-    with right:
-        if pdf_bytes:
-            st.download_button(
-                "⬇️ Download PDF report", data=pdf_bytes,
-                file_name=f"{filename}_report.pdf", mime="application/pdf", use_container_width=True,
-            )
-        else:
-            st.caption("PDF export requires ReportLab. CSV export is available now.")
+    else:
+        st.error("PDF export is unavailable because ReportLab is not installed. Check requirements.txt and redeploy.")
 
 
 # ---------- Spring design ----------
 def spring_module() -> None:
     page_header("🌀 Spring Design & 3D Simulation",
-                "Helical compression spring estimates with one shared applied-load value across the metrics and graphs.")
+                "Live spring calculations with a load-responsive 3D view and a complete PDF report.")
     with st.expander("Spring geometry and material inputs", expanded=True):
         a, b, c = st.columns(3)
         wire_d = a.number_input("Wire diameter d (mm)", min_value=0.5, max_value=30.0, value=4.0, step=0.5, key="sp_d")
@@ -139,10 +144,10 @@ def spring_module() -> None:
         active_n = c.number_input("Active coils n", min_value=1.0, max_value=100.0, value=8.0, step=1.0, key="sp_n")
         shear_g = a.number_input("Shear modulus G (MPa)", min_value=1000.0, max_value=150000.0, value=79300.0, step=1000.0, key="sp_G")
         load_range = b.number_input("Maximum load shown on graph (N)", min_value=100.0, max_value=10000.0, value=1000.0, step=100.0, key="sp_max_load")
-        st.caption("Educational estimate for a round-wire helical spring. Check fatigue, buckling, solid height, material limits and applicable standards before real design use.")
+        st.caption("Educational estimate. Fatigue, buckling, solid height, end conditions and material limits require separate validation.")
 
     if mean_d <= wire_d:
-        st.error("Mean coil diameter must be greater than the wire diameter. Increase D before using the results.")
+        st.error("Mean coil diameter must be greater than wire diameter. Increase D before using the results.")
         return
 
     spring_index = mean_d / wire_d
@@ -150,17 +155,21 @@ def spring_module() -> None:
         st.error("Spring index must be greater than 1. Check the geometry inputs.")
         return
 
-    # Single source of truth for the selected load. This exact value drives every metric and marker below.
     applied_load = st.slider(
         "Applied load (N)", min_value=0.0, max_value=float(load_range),
-        value=min(100.0, float(load_range)), step=max(1.0, float(load_range) / 1000.0), key="spring_applied_load",
+        value=min(float(st.session_state.get("spring_applied_load", 100.0)), float(load_range)),
+        step=max(1.0, float(load_range) / 1000.0), key="spring_applied_load",
+        help="The same load updates the calculation, graph marker, 3D spring compression and PDF report.",
     )
-
     stiffness = (shear_g * wire_d ** 4) / (8.0 * mean_d ** 3 * active_n)  # N/mm
     deflection = applied_load / stiffness if stiffness > 0 else 0.0
     wahl = ((4.0 * spring_index - 1.0) / (4.0 * spring_index - 4.0)) + (0.615 / spring_index)
     shear_stress = wahl * (8.0 * applied_load * mean_d) / (math.pi * wire_d ** 3)  # MPa
-    free_length_est = max(wire_d * (active_n + 2.0), 1.2 * active_n * wire_d)
+    free_length_est = max(wire_d * (active_n + 2.5), 1.5 * active_n * wire_d)
+    solid_height_est = wire_d * (active_n + 1.0)
+    available_travel = max(0.0, free_length_est - solid_height_est)
+    displayed_compression = min(deflection, available_travel * 0.95)
+    compressed_height = max(solid_height_est + available_travel * 0.05, free_length_est - displayed_compression)
 
     metric_row([
         ("Spring rate", f"{stiffness:.3f} N/mm", "k = G d⁴ / (8 D³ n)"),
@@ -168,64 +177,99 @@ def spring_module() -> None:
         ("Corrected shear stress", f"{shear_stress:.1f} MPa", "Includes Wahl factor"),
         ("Spring index", f"{spring_index:.2f}", "C = D / d"),
     ])
-    st.caption(f"Wahl factor: {wahl:.3f} · Illustrative free-length estimate: {free_length_est:.1f} mm · Applied load: {applied_load:.1f} N")
+    st.caption(f"Wahl factor: {wahl:.3f} · Estimated free length: {free_length_est:.1f} mm · Estimated solid height: {solid_height_est:.1f} mm")
+    if deflection > available_travel:
+        st.warning("Calculated deflection exceeds the estimated available travel before solid height. The 3D view is capped near solid height; the linear calculation is not a safe operating recommendation.")
 
     tab_curve, tab_3d = st.tabs(["Load–deflection curve", "3D spring view"])
+    loads = np.linspace(0.0, float(load_range), 151)
+    deflections = loads / stiffness
+    curve_fig = go.Figure()
+    curve_fig.add_trace(go.Scatter(x=deflections, y=loads, mode="lines", name="Linear spring response", line=dict(width=3)))
+    curve_fig.add_trace(go.Scatter(x=[deflection], y=[applied_load], mode="markers", name="Selected load",
+                                   marker=dict(size=13, symbol="diamond", line=dict(width=1))))
+    curve_fig.update_layout(title="Load vs. deflection", xaxis_title="Deflection (mm)", yaxis_title="Load (N)",
+                           xaxis=dict(range=[0, max(float(deflections.max()) * 1.05, 0.1)]),
+                           yaxis=dict(range=[0, float(load_range) * 1.04]))
     with tab_curve:
-        loads = np.linspace(0.0, float(load_range), 151)
-        deflections = loads / stiffness
-        fig = go.Figure()
-        fig.add_trace(go.Scatter(x=deflections, y=loads, mode="lines", name="Linear spring response", line=dict(width=3)))
-        fig.add_trace(go.Scatter(x=[deflection], y=[applied_load], mode="markers", name="Selected load",
-                                 marker=dict(size=13, symbol="diamond", line=dict(width=1))))
-        fig.update_layout(title="Load vs. deflection", xaxis_title="Deflection (mm)", yaxis_title="Load (N)",
-                          xaxis=dict(rangemode="tozero"), yaxis=dict(range=[0, float(load_range) * 1.04]))
-        st.plotly_chart(chart_layout(fig, 390), use_container_width=True,
+        st.plotly_chart(chart_layout(curve_fig, 370), use_container_width=True,
                          config={"responsive": True, "displayModeBar": False, "scrollZoom": False})
-        st.caption("The diamond and the deflection metric use the same selected-load control above.")
+        st.caption(f"Selected point: {deflection:.3f} mm deflection at {applied_load:.1f} N.")
+
     with tab_3d:
+        # Show unloaded and loaded shapes side by side. The loaded spring's axial pitch is
+        # scaled by the same selected load's calculated deflection, so it visibly shortens.
         turns = max(3.0, float(active_n) + 1.0)
-        theta = np.linspace(0.0, 2.0 * math.pi * turns, 700)
-        pitch = free_length_est / turns
+        theta = np.linspace(0.0, 2.0 * math.pi * turns, 900)
         radius = mean_d / 2.0
-        x = radius * np.cos(theta)
-        y = radius * np.sin(theta)
-        z = (pitch / (2.0 * math.pi)) * theta
-        spring_fig = go.Figure(go.Scatter3d(x=x, y=y, z=z, mode="lines", line=dict(width=7), name="Helical spring"))
+        x0 = radius * np.cos(theta)
+        y0 = radius * np.sin(theta)
+        z0 = free_length_est * theta / (2.0 * math.pi * turns)
+        z_loaded = compressed_height * theta / (2.0 * math.pi * turns)
+        offset = radius * 1.35
+        spring_fig = go.Figure()
+        spring_fig.add_trace(go.Scatter3d(x=x0 - offset, y=y0, z=z0, mode="lines",
+                                          line=dict(width=6, color="#8A96A3"), name="Unloaded reference"))
+        spring_fig.add_trace(go.Scatter3d(x=x0 + offset, y=y0, z=z_loaded, mode="lines",
+                                          line=dict(width=8, color="#00A6A6"), name="Loaded spring"))
         spring_fig.update_layout(
-            title="Helical spring geometry (schematic)",
-            scene=dict(xaxis_title="X (mm)", yaxis_title="Y (mm)", zaxis_title="Height (mm)",
-                       aspectmode="data", camera=dict(eye=dict(x=1.7, y=1.8, z=1.25))),
-            margin=dict(l=0, r=0, t=50, b=0), height=460,
+            title=f"Spring compression — {applied_load:.1f} N · calculated deflection {deflection:.2f} mm",
+            scene=dict(xaxis_title="X (mm; springs offset for comparison)", yaxis_title="Y (mm)", zaxis_title="Height (mm)",
+                       aspectmode="manual", aspectratio=dict(x=1.25, y=1, z=1.35),
+                       camera=dict(eye=dict(x=1.7, y=1.9, z=1.35))),
+            margin=dict(l=0, r=0, t=65, b=0), height=420,
+            legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="left", x=0),
         )
         st.plotly_chart(spring_fig, use_container_width=True,
                          config={"responsive": True, "displayModeBar": True, "scrollZoom": False})
-        st.caption("Schematic geometry only; the coil shape is not a deformation/contact simulation.")
+        st.caption(f"Gray = unloaded reference ({free_length_est:.1f} mm). Teal = loaded shape ({compressed_height:.1f} mm). The schematic shortens with applied load; it is not a contact or finite-element simulation.")
 
-    loads_export = np.linspace(0.0, float(load_range), 151)
-    df = pd.DataFrame({
-        "load_N": loads_export,
-        "deflection_mm": loads_export / stiffness,
-        "wire_diameter_mm": wire_d,
-        "mean_coil_diameter_mm": mean_d,
-        "active_coils": active_n,
-        "shear_modulus_MPa": shear_g,
-    })
-    downloads("spring_design", df, "Spring Design Report", [
-        "MechLab Studio — Spring Design Report",
-        f"Wire diameter: {wire_d:.3f} mm",
-        f"Mean coil diameter: {mean_d:.3f} mm",
-        f"Active coils: {active_n:.2f}",
-        f"Shear modulus: {shear_g:.2f} MPa",
-        f"Spring index: {spring_index:.4f}",
-        f"Spring rate: {stiffness:.5f} N/mm",
-        f"Applied load: {applied_load:.3f} N",
-        f"Estimated deflection at applied load: {deflection:.4f} mm",
-        f"Wahl factor: {wahl:.5f}",
-        f"Corrected shear stress estimate: {shear_stress:.3f} MPa",
-        "Educational preliminary calculation; fatigue, buckling, solid height, end conditions and material allowable stress are not verified.",
-    ])
-    st.warning("This preliminary model assumes linear elastic behavior. It does not certify a real spring design or check fatigue, buckling, coil clash or manufacturing limits.")
+    # Prepare a printable, selected-state graph with a clearly visible marker.
+    fig_mpl, ax = plt.subplots(figsize=(9, 4.8), dpi=160)
+    ax.plot(deflections, loads, linewidth=2.5, label="Linear spring response")
+    ax.scatter([deflection], [applied_load], s=90, marker="D", zorder=4, label=f"Selected: {applied_load:.1f} N")
+    ax.set_title("Spring load–deflection curve")
+    ax.set_xlabel("Deflection (mm)")
+    ax.set_ylabel("Load (N)")
+    ax.set_xlim(0, max(float(deflections.max()) * 1.05, 0.1))
+    ax.set_ylim(0, float(load_range) * 1.04)
+    ax.grid(True, alpha=0.3)
+    ax.legend(loc="best")
+    fig_mpl.tight_layout()
+    graph_buffer = io.BytesIO()
+    fig_mpl.savefig(graph_buffer, format="png", bbox_inches="tight")
+    plt.close(fig_mpl)
+    graph_png = graph_buffer.getvalue()
+
+    report_lines = [
+        "SECTION: Selected design inputs",
+        f"Wire diameter, d = {wire_d:.3f} mm",
+        f"Mean coil diameter, D = {mean_d:.3f} mm",
+        f"Active coils, n = {active_n:.3f}",
+        f"Shear modulus, G = {shear_g:.2f} MPa",
+        f"Selected applied load, F = {applied_load:.3f} N",
+        f"Graph load range = 0 to {load_range:.3f} N",
+        "SECTION: Calculation steps",
+        f"1. Spring index: C = D/d = {mean_d:.3f}/{wire_d:.3f} = {spring_index:.5f}",
+        f"2. Spring rate: k = G d^4/(8 D^3 n) = {shear_g:.2f} × {wire_d:.3f}^4/(8 × {mean_d:.3f}^3 × {active_n:.3f}) = {stiffness:.6f} N/mm",
+        f"3. Deflection: δ = F/k = {applied_load:.3f}/{stiffness:.6f} = {deflection:.5f} mm",
+        f"4. Wahl factor: Kw = (4C−1)/(4C−4) + 0.615/C = {wahl:.6f}",
+        f"5. Corrected shear stress: τ = Kw × 8FD/(πd³) = {shear_stress:.4f} MPa",
+        "SECTION: Additional estimates and selected output",
+        f"Estimated free length = {free_length_est:.3f} mm",
+        f"Estimated solid height = d(n+1) = {solid_height_est:.3f} mm",
+        f"Estimated available travel = {available_travel:.3f} mm",
+        f"Displayed 3D compression (capped near solid height) = {displayed_compression:.3f} mm",
+        f"Loaded 3D height = {compressed_height:.3f} mm",
+        f"Selected-load point on graph = ({deflection:.5f} mm, {applied_load:.3f} N)",
+        "SECTION: Assumptions and limitations",
+        "The analytical curve assumes linear elastic behavior and constant spring rate.",
+        "The 3D view is a schematic visual comparison, not finite-element analysis or coil-contact simulation.",
+        "Fatigue life, buckling, surge, end geometry, material allowable stress, manufacturing tolerances and standards compliance are not verified.",
+        "Do not use this preliminary educational report alone to approve a real spring design.",
+    ]
+    downloads("spring_design", "MechLab Studio — Complete Spring Design Report", report_lines, graph_png)
+    st.warning("This is an educational preliminary model. Validate spring fatigue, buckling, solid height, material limits and applicable standards before real-world use.")
 
 
 # ---------- Gear & machine design ----------
@@ -265,7 +309,7 @@ def gear_module() -> None:
                         "assumed_efficiency_pct": eff, "output_power_kW": out_power, "input_torque_Nm": tin,
                         "output_torque_Nm": tout, "module_mm": module_mm, "driver_pitch_diameter_mm": d1,
                         "driven_pitch_diameter_mm": d2, "centre_distance_mm": center}])
-    downloads("gear_analysis", df, "Gear Pair Analysis Report", [
+    downloads("gear_analysis", "Gear Pair Analysis Report", [
         f"Driver teeth: {z1}", f"Driven teeth: {z2}", f"Ratio: {ratio:.4f}:1",
         f"Input speed: {rpm:.2f} rpm", f"Output speed: {out_rpm:.2f} rpm",
         f"Input power: {power:.3f} kW", f"Assumed efficiency: {eff:.2f}%",
@@ -307,7 +351,7 @@ def thermal_module() -> None:
     ft.update_layout(title="Simplified center-point trend", xaxis_title="Time (s)", yaxis_title="Illustrative temperature (°C)")
     st.plotly_chart(chart_layout(ft, 320), use_container_width=True, config={"responsive": True, "displayModeBar": False})
     df = pd.DataFrame({"x_mm": X.ravel(), "y_mm": Y.ravel(), "illustrative_temperature_C": temp.ravel()})
-    downloads("thermal_simulation", df, "Thermal Simulation Report", [
+    downloads("thermal_simulation", "Thermal Simulation Report", [
         f"Input power: {q:.2f} W", f"Effective heat fraction: {eta:.3f}",
         f"Thermal diffusivity: {alpha:.4f} mm²/s", f"Heating time: {duration:.2f} s",
         f"Illustrative peak temperature: {peak:.3f} °C",
@@ -346,7 +390,7 @@ def robotics_module() -> None:
     df = pd.DataFrame([{"link1_mm": L1, "link2_mm": L2, "joint1_deg": t1,
                         "joint2_relative_deg": t2, "joint2_absolute_deg": t1 + t2,
                         "end_effector_x_mm": x2, "end_effector_y_mm": y2, "reach_mm": reach}])
-    downloads("robot_kinematics", df, "Robot Kinematics Report", [
+    downloads("robot_kinematics", "Robot Kinematics Report", [
         f"Link 1: {L1:.3f} mm", f"Link 2: {L2:.3f} mm", f"Joint 1 angle: {t1} degrees",
         f"Joint 2 relative angle: {t2} degrees", f"End effector X: {x2:.3f} mm",
         f"End effector Y: {y2:.3f} mm", f"Reach: {reach:.3f} mm",
@@ -388,7 +432,7 @@ def materials_module() -> None:
     st.plotly_chart(chart_layout(fig, 410), use_container_width=True, config={"responsive": True, "displayModeBar": False})
     df = pd.DataFrame({"engineering_strain_fraction": strain, "engineering_strain_pct": strain * 100,
                        "illustrative_stress_MPa": stress})
-    downloads("materials_stress_strain", df, "Materials Stress Strain Report", [
+    downloads("materials_stress_strain", "Materials Stress Strain Report", [
         f"Young's modulus: {E:.3f} GPa", f"Yield strength: {ys:.3f} MPa",
         f"Ultimate strength input: {uts:.3f} MPa", f"Estimated yield strain: {ey * 100:.5f}%",
         f"Selected strain: {sel_pct:.4f}%", f"Illustrative selected stress: {selected_stress:.3f} MPa",
@@ -491,7 +535,7 @@ if active == "Home":
     st.markdown("### Project notes")
     c1, c2, c3 = st.columns(3)
     c1.metric("Workspaces", "6", "One active workspace at a time")
-    c2.metric("Export formats", "CSV + PDF", "PDF requires ReportLab")
+    c2.metric("Export format", "PDF report", "Calculations and selected results")
     c3.metric("AI connection", "Groq API", "Key stored in Streamlit Secrets")
     st.caption("Engineering results are educational preliminary estimates. Validate against authoritative references and applicable standards before real-world use.")
 elif active == "Spring Design":
