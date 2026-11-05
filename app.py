@@ -1,0 +1,996 @@
+from __future__ import annotations
+
+import io
+import math
+from typing import Iterable
+
+import numpy as np
+import pandas as pd
+import plotly.graph_objects as go
+import requests
+import streamlit as st
+from engineering_core import (
+    spring_result, symbolic_spring_equations, gear_pair, planar_two_link,
+    simply_supported_circular_beam, solid_shaft_combined_load,
+    thin_wall_cylinder_stress, pipe_flow_calculation, sdof_free_vibration,
+)
+
+st.set_page_config(
+    page_title="MechLab Studio | Engineering Workbench",
+    page_icon="⚙️",
+    layout="wide",
+    initial_sidebar_state="collapsed",
+)
+
+# ---------- Shared styling and helpers ----------
+st.markdown(
+    """
+    <style>
+      .block-container {padding-top: 1.25rem; padding-bottom: 2rem; max-width: 1200px;}
+      .hero { padding: 1.35rem 1.4rem; border-radius: 18px; margin-bottom: 1rem;
+              background: linear-gradient(120deg, rgba(30,88,140,.18), rgba(31,158,137,.10));
+              border: 1px solid rgba(120,140,160,.28); }
+      .hero h1 { margin: 0 0 .35rem 0; }
+      .hero p { margin: 0; font-size: 1rem; opacity: .88; }
+      .module-card { padding: 1rem; border: 1px solid rgba(120,140,160,.3); border-radius: 14px;
+                     min-height: 112px; margin-bottom: .35rem; }
+      .module-card h3 { margin: 0 0 .45rem 0; font-size: 1.08rem; }
+      .module-card p { margin: 0; opacity: .82; font-size: .93rem; }
+      [data-testid="stMetric"] { border: 1px solid rgba(120,140,160,.22); padding: .7rem .8rem;
+                                  border-radius: 12px; }
+      [data-testid="stSidebar"] { min-width: 245px; }
+      [data-testid="stPlotlyChart"] { width: 100%; }
+      button, [role="button"] { min-height: 42px; }
+      @media (max-width: 640px) {
+        .block-container { padding-left: .65rem; padding-right: .65rem; padding-top: .65rem; }
+        .hero { padding: .85rem; }
+        .hero h1 { font-size: 1.65rem; }
+        [data-testid="stMetric"] { padding: .45rem; }
+        [data-testid="stMetricValue"] { font-size: 1.15rem; }
+        [data-testid="stSidebar"] { min-width: 0; }
+      }
+    </style>
+    """,
+    unsafe_allow_html=True,
+)
+
+MODULES = {
+    "Spring Design": ("🌀", "Spring calculations, load–deflection curve, and a 3D helical spring view."),
+    "Gear & Machine Design": ("⚙️", "Ideal spur-gear ratio, speed, torque, pitch circles, and report exports."),
+    "Thermal & Welding": ("🌡️", "Explore an illustrative 2D heat field and center-point trend."),
+    "Robotics & Kinematics": ("🦾", "Visualize a two-link planar robot arm and calculate its end position."),
+    "Materials & Stress–Strain": ("📈", "Explore an idealized tensile stress–strain curve."),
+    "Beam & Shaft Basics": ("📐", "Estimate reactions, bending stress and mid-span deflection for a center-loaded round beam."),
+    "Shaft Torsion & Combined Loading": ("🔩", "Calculate shaft bending stress, torsional shear, von Mises stress and twist."),
+    "Vibration & Dynamics": ("〰️", "Simulate underdamped, critically damped and overdamped single-DOF free response."),
+    "Pressure Vessel Basics": ("🛢️", "Estimate membrane stresses in a closed thin-walled cylindrical vessel."),
+    "Pipe Flow & Pump Sizing": ("💧", "Estimate Reynolds number, Darcy friction, head loss and pump input power."),
+    "AI Engineering Tutor": ("🤖", "Ask the existing online Groq-powered mechanical engineering tutor."),
+}
+
+
+def page_header(title: str, subtitle: str) -> None:
+    st.markdown(f"## {title}")
+    st.caption(subtitle)
+    st.divider()
+
+
+def metric_row(items: list[tuple[str, str, str]]) -> None:
+    cols = st.columns(len(items))
+    for col, (label, value, help_text) in zip(cols, items):
+        col.metric(label, value, help=help_text)
+
+
+def chart_layout(fig: go.Figure, height: int = 420) -> go.Figure:
+    fig.update_layout(
+        autosize=True,
+        height=height,
+        margin=dict(l=12, r=12, t=58, b=12),
+        font=dict(size=12),
+        title=dict(x=0.02, xanchor="left", y=0.97),
+        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="left", x=0),
+        paper_bgcolor="rgba(0,0,0,0)",
+        plot_bgcolor="rgba(0,0,0,0)",
+    )
+    return fig
+
+
+def _make_pdf(title: str, df: pd.DataFrame, lines: Iterable[str]) -> bytes | None:
+    """Build a compact, single-page calculation PDF (no graphs)."""
+    try:
+        from reportlab.lib import colors
+        from reportlab.lib.enums import TA_LEFT
+        from reportlab.lib.pagesizes import letter
+        from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+        from reportlab.lib.units import inch
+        from reportlab.platypus import (
+            SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle, KeepInFrame
+        )
+
+        output = io.BytesIO()
+        doc = SimpleDocTemplate(
+            output, pagesize=letter, rightMargin=.45*inch, leftMargin=.45*inch,
+            topMargin=.38*inch, bottomMargin=.38*inch
+        )
+        styles = getSampleStyleSheet()
+        styles.add(ParagraphStyle(
+            name="ReportBodyCompact", parent=styles["BodyText"], alignment=TA_LEFT,
+            fontSize=7.2, leading=8.6, spaceAfter=2.5, textColor=colors.HexColor("#243244")
+        ))
+        styles.add(ParagraphStyle(
+            name="ReportSmallCompact", parent=styles["BodyText"], fontSize=6.3,
+            leading=7.2, spaceAfter=0, wordWrap="CJK"
+        ))
+        styles.add(ParagraphStyle(
+            name="ReportTitleCompact", parent=styles["Title"], fontSize=15, leading=17,
+            spaceAfter=3, textColor=colors.HexColor("#172b4d")
+        ))
+        story = [
+            Paragraph(str(title).replace("&", "&amp;"), styles["ReportTitleCompact"]),
+            Paragraph("MECHLAB STUDIO · CALCULATION SUMMARY", styles["ReportSmallCompact"]),
+            Spacer(1, 5),
+        ]
+        if df is not None and not df.empty:
+            headers = [str(c) for c in df.columns]
+            usable_width = letter[0] - .9*inch
+            if len(df) == 1:
+                table_data = [[Paragraph("Parameter", styles["ReportSmallCompact"]),
+                               Paragraph("Reading / result", styles["ReportSmallCompact"])]]
+                for header, value in zip(headers, df.iloc[0].tolist()):
+                    if pd.isna(value):
+                        shown = "—"
+                    elif isinstance(value, (float, np.floating)):
+                        shown = f"{float(value):.7g}"
+                    else:
+                        shown = str(value)
+                    header_safe = header.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+                    shown = shown.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+                    table_data.append([Paragraph(header_safe, styles["ReportSmallCompact"]),
+                                       Paragraph(shown, styles["ReportSmallCompact"])])
+                col_widths = [usable_width * .43, usable_width * .57]
+            else:
+                table_data = [[Paragraph(h.replace("&", "&amp;"), styles["ReportSmallCompact"]) for h in headers]]
+                for row in df.itertuples(index=False, name=None):
+                    cells = []
+                    for value in row:
+                        if pd.isna(value):
+                            shown = "—"
+                        elif isinstance(value, (float, np.floating)):
+                            shown = f"{float(value):.6g}"
+                        else:
+                            shown = str(value)
+                        shown = shown.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+                        cells.append(Paragraph(shown, styles["ReportSmallCompact"]))
+                    table_data.append(cells)
+                col_widths = [usable_width / max(len(headers), 1)] * len(headers)
+            readings_table = Table(table_data, colWidths=col_widths, hAlign="LEFT")
+            readings_table.setStyle(TableStyle([
+                ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#e8eef5")),
+                ("TEXTCOLOR", (0, 0), (-1, 0), colors.HexColor("#172b4d")),
+                ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
+                ("GRID", (0, 0), (-1, -1), .3, colors.HexColor("#cbd5e1")),
+                ("VALIGN", (0, 0), (-1, -1), "TOP"),
+                ("LEFTPADDING", (0, 0), (-1, -1), 3),
+                ("RIGHTPADDING", (0, 0), (-1, -1), 3),
+                ("TOPPADDING", (0, 0), (-1, -1), 2.5),
+                ("BOTTOMPADDING", (0, 0), (-1, -1), 2.5),
+            ]))
+            story.extend([Paragraph("Readings and calculated results", styles["Heading3"]), readings_table, Spacer(1, 5)])
+        story.append(Paragraph("Calculation details and assumptions", styles["Heading3"]))
+        for line in lines:
+            safe = str(line).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+            story.append(Paragraph(safe, styles["ReportBodyCompact"]))
+
+        # KeepInFrame shrinks the complete story as needed, preventing multi-page reports.
+        max_w = letter[0] - .9*inch
+        max_h = letter[1] - .76*inch
+        doc.build([KeepInFrame(max_w, max_h, story, mode="shrink", hAlign="LEFT", vAlign="TOP")])
+        return output.getvalue()
+    except ImportError:
+        return None
+
+
+def downloads(filename: str, df: pd.DataFrame, report_title: str, report_lines: list[str],
+              graph_specs: list[dict] | None = None, report_df: pd.DataFrame | None = None) -> None:
+    # graph_specs remains accepted for backwards compatibility with module calls,
+    # but is deliberately never included in exported reports.
+    csv_bytes = df.to_csv(index=False).encode("utf-8-sig")
+    st.download_button("⬇️ Download readings (CSV)", data=csv_bytes,
+                       file_name=f"{filename}_readings.csv", mime="text/csv",
+                       use_container_width=True)
+    pdf_source = report_df if report_df is not None else df
+    if report_df is None and len(df) > 12:
+        pdf_source = pd.DataFrame([{
+            "Detailed readings in CSV": len(df),
+            "PDF summary": "See calculation details below; full data retained in CSV."
+        }])
+    pdf_bytes = _make_pdf(report_title, pdf_source, report_lines)
+    if pdf_bytes:
+        st.download_button("⬇️ Download calculation report (PDF)", data=pdf_bytes,
+                           file_name=f"{filename}_calculations.pdf", mime="application/pdf",
+                           use_container_width=True)
+    else:
+        st.error("PDF export is unavailable because a required reporting dependency is missing. Please check requirements.txt.")
+
+
+# ---------- Spring design ----------
+def spring_module() -> None:
+    page_header(
+        "🌀 Spring Design & 3D Simulation",
+        "Change the applied load and watch the calculated deflection, graph marker, and 3D spring update together.",
+    )
+    with st.expander("Spring geometry and material inputs", expanded=True):
+        a, b, c = st.columns(3)
+        wire_d = a.number_input("Wire diameter d (mm)", min_value=0.5, max_value=30.0, value=4.0, step=0.5, key="sp_d")
+        mean_d = b.number_input("Mean coil diameter D (mm)", min_value=2.0, max_value=300.0, value=25.0, step=1.0, key="sp_D")
+        active_n = c.number_input("Active coils n", min_value=1.0, max_value=100.0, value=8.0, step=1.0, key="sp_n")
+        shear_g = a.number_input("Shear modulus G (MPa)", min_value=1000.0, max_value=150000.0, value=79300.0, step=1000.0, key="sp_G")
+        free_length = b.number_input("Free length L₀ (mm)", min_value=1.0, max_value=1000.0, value=60.0, step=1.0, key="sp_free_length")
+        load_range = c.number_input("Maximum load shown on graph (N)", min_value=100.0, max_value=10000.0, value=1000.0, step=100.0, key="sp_max_load")
+        st.caption(
+            "Preliminary round-wire helical compression-spring model. Solid height is estimated as "
+            "wire diameter × (active coils + 2 end coils); actual end geometry can differ."
+        )
+
+    if mean_d <= wire_d:
+        st.error("Mean coil diameter must be greater than wire diameter. Increase D before using the results.")
+        return
+    spring_index = mean_d / wire_d
+    if spring_index <= 1.0:
+        st.error("Spring index must be greater than 1. Check the geometry inputs.")
+        return
+
+    if spring_index < 4.0 or spring_index > 12.0:
+        st.warning("Spring index is outside the commonly used preliminary range of about 4–12. Review manufacturability and a suitable design reference.")
+    solid_height = wire_d * (active_n + 2.0)
+    if free_length <= solid_height:
+        st.error(
+            f"Free length must exceed the estimated solid height ({solid_height:.2f} mm). "
+            "Increase the free length or review the coil dimensions."
+        )
+        return
+
+    # One source of truth: this load drives calculations, graph marker, 3D geometry, and PDF.
+    applied_load = st.slider(
+        "Applied load (N)",
+        min_value=0.0,
+        max_value=float(load_range),
+        value=min(100.0, float(load_range)),
+        step=max(1.0, float(load_range) / 1000.0),
+        key="spring_applied_load",
+    )
+
+    try:
+        result = spring_result(wire_d, mean_d, active_n, shear_g, free_length, applied_load)
+    except ValueError as exc:
+        st.error(f"Spring calculation stopped: {exc}")
+        return
+    stiffness = result.stiffness_n_per_mm
+    deflection = result.deflection_mm
+    wahl = result.wahl_factor
+    shear_stress = result.corrected_shear_stress_mpa
+    solid_height = result.solid_height_mm
+    available_travel = result.available_travel_mm
+    visual_deflection = min(deflection, available_travel)
+    loaded_height = result.loaded_height_mm
+    travel_used_pct = 100.0 * deflection / available_travel if available_travel > 0 else math.inf
+
+    metric_row([
+        ("Spring rate", f"{stiffness:.3f} N/mm", "k = Gd⁴ / (8D³n)"),
+        ("Calculated deflection", f"{deflection:.2f} mm", f"At {applied_load:.1f} N"),
+        ("Corrected shear stress", f"{shear_stress:.1f} MPa", "Includes Wahl factor"),
+        ("Spring index", f"{spring_index:.2f}", "C = D / d"),
+    ])
+    st.caption(
+        f"Selected load: {applied_load:.1f} N · Wahl factor: {wahl:.3f} · "
+        f"Estimated solid height: {solid_height:.1f} mm · Available travel: {available_travel:.1f} mm"
+    )
+
+    if result.travel_exceeded:
+        st.warning(
+            f"The linear calculation predicts {deflection:.2f} mm deflection, exceeding the estimated "
+            f"available travel of {available_travel:.2f} mm. The 3D spring is shown at its estimated "
+            "solid-height limit; the physical spring cannot continue compressing as a linear spring."
+        )
+    else:
+        st.success(f"Current load uses {travel_used_pct:.1f}% of the estimated available travel.")
+
+    tab_curve, tab_3d = st.tabs(["Load–deflection curve", "3D spring simulation"])
+    with tab_curve:
+        loads = np.linspace(0.0, float(load_range), 201)
+        deflections = loads / stiffness
+        fig = go.Figure()
+        fig.add_trace(go.Scatter(
+            x=deflections, y=loads, mode="lines", name="Linear spring response",
+            line=dict(width=3),
+        ))
+        fig.add_trace(go.Scatter(
+            x=[deflection], y=[applied_load], mode="markers", name="Current load",
+            marker=dict(size=13, symbol="diamond", line=dict(width=1)),
+        ))
+        fig.add_vline(x=available_travel, line_dash="dash", annotation_text="Estimated travel limit")
+        fig.update_layout(
+            title="Applied load vs. calculated deflection",
+            xaxis_title="Deflection (mm)", yaxis_title="Load (N)",
+            xaxis=dict(rangemode="tozero"),
+            yaxis=dict(range=[0, float(load_range) * 1.04]),
+        )
+        st.plotly_chart(
+            chart_layout(fig, 390), use_container_width=True,
+            config={"responsive": True, "displayModeBar": False, "scrollZoom": False},
+        )
+        st.caption("The marker follows the applied-load slider. The dashed line marks the estimated travel limit.")
+
+    with tab_3d:
+        show_reference = st.checkbox("Show unloaded reference spring", value=False, key="sp_show_reference")
+        turns = max(3.0, float(active_n) + 2.0)
+        radius = mean_d / 2.0
+
+        def spring_xyz(height: float):
+            theta = np.linspace(0.0, 2.0 * math.pi * turns, 900)
+            # Keep the coil path inside the end planes; geometry height tracks the calculated compression.
+            z = (wire_d / 2.0) + (max(wire_d, height - wire_d) * theta / (2.0 * math.pi * turns))
+            return radius * np.cos(theta), radius * np.sin(theta), z
+
+        x_loaded, y_loaded, z_loaded = spring_xyz(loaded_height)
+        spring_fig = go.Figure()
+        if show_reference:
+            x_ref, y_ref, z_ref = spring_xyz(free_length)
+            spring_fig.add_trace(go.Scatter3d(
+                x=x_ref, y=y_ref, z=z_ref, mode="lines",
+                name=f"Unloaded reference ({free_length:.1f} mm)",
+                line=dict(width=5, color="#8b8ba7"),
+            ))
+        spring_fig.add_trace(go.Scatter3d(
+            x=x_loaded, y=y_loaded, z=z_loaded, mode="lines",
+            name=f"Current spring ({loaded_height:.1f} mm)",
+            line=dict(width=8, color="#159a9c"),
+        ))
+        spring_fig.update_layout(
+            title=f"Spring at {applied_load:.1f} N · deflection {deflection:.2f} mm",
+            scene=dict(
+                xaxis_title="X (mm)", yaxis_title="Y (mm)", zaxis_title="Height (mm)",
+                aspectmode="manual", aspectratio=dict(x=1, y=1, z=1.25),
+                camera=dict(eye=dict(x=1.7, y=1.8, z=1.3)),
+            ),
+            margin=dict(l=0, r=0, t=60, b=0), height=440,
+            legend=dict(orientation="h", yanchor="bottom", y=1.02, x=0),
+        )
+        st.plotly_chart(
+            spring_fig, use_container_width=True,
+            config={"responsive": True, "displayModeBar": False, "scrollZoom": False},
+        )
+        st.caption(
+            f"Free length: {free_length:.1f} mm · Current displayed height: {loaded_height:.1f} mm · "
+            f"Displayed compression: {visual_deflection:.2f} mm. "
+            "The 3D helix is a visualization, not finite-element analysis."
+        )
+
+    loads_export = np.linspace(0.0, float(load_range), 201)
+    df = pd.DataFrame({
+        "load_N": loads_export,
+        "deflection_mm": loads_export / stiffness,
+        "wire_diameter_mm": wire_d,
+        "mean_coil_diameter_mm": mean_d,
+        "active_coils": active_n,
+        "shear_modulus_MPa": shear_g,
+    })
+    downloads("spring_design", df, "Spring Design Report", [
+        "MechLab Studio — Spring Design Report",
+        f"Wire diameter d: {wire_d:.3f} mm",
+        f"Mean coil diameter D: {mean_d:.3f} mm",
+        f"Active coils n: {active_n:.2f}",
+        f"Shear modulus G: {shear_g:.2f} MPa",
+        f"Free length L0: {free_length:.3f} mm",
+        f"Estimated solid height: {solid_height:.3f} mm",
+        f"Estimated available travel: {available_travel:.3f} mm",
+        f"Spring index C = D/d: {spring_index:.4f}",
+        f"Spring rate k = Gd^4/(8D^3n): {stiffness:.5f} N/mm",
+        f"Applied load F: {applied_load:.3f} N",
+        f"Calculated deflection δ = F/k: {deflection:.4f} mm",
+        f"Displayed deflection after travel limit: {visual_deflection:.4f} mm",
+        f"Displayed spring height: {loaded_height:.4f} mm",
+        f"Wahl factor: {wahl:.5f}",
+        f"Corrected shear stress estimate: {shear_stress:.3f} MPa",
+        f"Estimated load at travel limit (SciPy root solve): {result.travel_limit_load_n:.3f} N",
+        *symbolic_spring_equations().values(),
+        "Assumptions: linear elastic spring, round wire, estimated solid height based on active coils + two end coils.",
+        "Not verified: fatigue life, buckling, end conditions, coil clash, material allowable stress, manufacturing tolerances, or design-standard compliance.",
+    ], graph_specs=[{
+        "title": "Load–deflection curve",
+        "xlabel": "Deflection (mm)", "ylabel": "Load (N)",
+        "series": [
+            {"x": (loads_export / stiffness).tolist(), "y": loads_export.tolist(), "label": "Linear response"},
+            {"x": [deflection], "y": [applied_load], "label": "Selected load"},
+        ],
+    }], report_df=pd.DataFrame([{
+        "wire_diameter_mm": wire_d, "mean_coil_diameter_mm": mean_d,
+        "active_coils": active_n, "shear_modulus_MPa": shear_g,
+        "free_length_mm": free_length, "applied_load_N": applied_load,
+        "spring_rate_N_per_mm": stiffness, "deflection_mm": deflection,
+        "Wahl_factor": wahl, "corrected_shear_stress_MPa": shear_stress,
+        "estimated_solid_height_mm": solid_height,
+        "available_travel_mm": available_travel,
+        "loaded_height_mm": loaded_height, "travel_limit_load_N": result.travel_limit_load_n,
+    }]))
+    st.warning(
+        "Preliminary educational model only. The free length and solid height are simplified estimates; "
+        "fatigue, buckling, coil clash, end geometry, and material limits are not certified."
+    )
+
+
+# ---------- Gear & machine design ----------
+def gear_module() -> None:
+    page_header("⚙️ Gear & Machine Design", "A focused workspace for external spur-gear pairs and ideal gear-train calculations.")
+    with st.expander("Gear inputs", expanded=True):
+        a, b, c = st.columns(3)
+        z1 = a.number_input("Driver teeth", 8, 300, 20, key="g_z1")
+        z2 = b.number_input("Driven teeth", 8, 600, 60, key="g_z2")
+        rpm = a.number_input("Driver speed (rpm)", 1.0, 100000.0, 1200.0, key="g_rpm")
+        module_mm = c.number_input("Module (mm)", 0.25, 50.0, 2.0, key="g_mod")
+        power = b.number_input("Input power (kW)", 0.01, 10000.0, 2.0, key="g_power")
+        eff = c.number_input("Estimated efficiency (%)", 1.0, 100.0, 95.0, key="g_eff")
+    gear_calc = gear_pair(int(z1), int(z2), float(rpm), float(power), float(eff))
+    ratio = gear_calc["ratio"]
+    out_rpm = gear_calc["output_rpm"]
+    out_power = gear_calc["output_power_kw"]
+    tin = gear_calc["input_torque_nm"]
+    tout = gear_calc["output_torque_nm"]
+    d1, d2 = module_mm * z1, module_mm * z2
+    center = (d1 + d2) / 2.0
+    metric_row([
+        ("Gear ratio", f"{ratio:.3f}:1", "Driven teeth / driver teeth"),
+        ("Output speed", f"{out_rpm:.1f} rpm", "Ideal speed ratio"),
+        ("Output torque", f"{tout:.2f} N·m", "Includes assumed efficiency"),
+        ("Centre distance", f"{center:.2f} mm", "Standard external spur gears"),
+    ])
+    st.caption(f"Driver pitch diameter: {d1:.2f} mm · Driven pitch diameter: {d2:.2f} mm · Input torque: {tin:.2f} N·m")
+    t = np.linspace(0, 2 * np.pi, 160)
+    fig = go.Figure()
+    fig.add_trace(go.Scatter(x=d1 / 2 * np.cos(t), y=d1 / 2 * np.sin(t), mode="lines", name=f"Driver ({z1} teeth)"))
+    fig.add_trace(go.Scatter(x=center + d2 / 2 * np.cos(t), y=d2 / 2 * np.sin(t), mode="lines", name=f"Driven ({z2} teeth)"))
+    fig.update_layout(title="Pitch-circle layout (schematic)", xaxis_title="X (mm)", yaxis_title="Y (mm)",
+                      yaxis=dict(scaleanchor="x", scaleratio=1))
+    st.plotly_chart(chart_layout(fig, 390), use_container_width=True, config={"responsive": True, "displayModeBar": False})
+    gear_angle = st.slider("Gear rotation angle (°)", 0, 360, 0, 5, key="g_angle")
+    phase1 = math.radians(gear_angle)
+    phase2 = -phase1 * z1 / z2
+    gear3d = go.Figure()
+    for radius, cx, teeth, phase, label, color in [
+        (d1/2, 0.0, z1, phase1, "Driver", "#5276b8"),
+        (d2/2, center, z2, phase2, "Driven", "#19a39a"),
+    ]:
+        theta = np.linspace(0, 2*np.pi, max(240, teeth*12))
+        # Pitch-circle rim and radial tooth-tip markers form an explicitly schematic 3D gear.
+        rr = radius * (1.0 + 0.07 * np.cos(teeth * (theta - phase)))
+        xx, yy = cx + rr*np.cos(theta), rr*np.sin(theta)
+        gear3d.add_trace(go.Scatter3d(x=xx, y=yy, z=np.zeros_like(xx), mode="lines",
+                                      name=f"{label} gear ({teeth} teeth)", line=dict(width=7, color=color)))
+        gear3d.add_trace(go.Scatter3d(x=[cx, cx], y=[0, 0], z=[-2, 2], mode="lines",
+                                      showlegend=False, line=dict(width=10, color=color)))
+    gear3d.update_layout(title=f"3D schematic gear pair · driver {gear_angle}°",
+                         scene=dict(xaxis_title="X (mm)", yaxis_title="Y (mm)", zaxis_title="Thickness (mm)",
+                                    aspectmode="data", camera=dict(eye=dict(x=1.5,y=1.7,z=1.2))),
+                         height=420, margin=dict(l=0,r=0,t=55,b=0))
+    st.plotly_chart(gear3d, use_container_width=True,
+                    config={"responsive": True, "displayModeBar": False, "scrollZoom": False})
+    st.caption("Use the rotation slider to change the schematic gear phase. This is not a tooth-contact or load-strength simulation.")
+    df = pd.DataFrame([{"driver_teeth": z1, "driven_teeth": z2, "gear_ratio": ratio,
+                        "input_speed_rpm": rpm, "output_speed_rpm": out_rpm, "input_power_kW": power,
+                        "assumed_efficiency_pct": eff, "output_power_kW": out_power, "input_torque_Nm": tin,
+                        "output_torque_Nm": tout, "module_mm": module_mm, "driver_pitch_diameter_mm": d1,
+                        "driven_pitch_diameter_mm": d2, "centre_distance_mm": center}])
+    downloads("gear_analysis", df, "Gear Pair Analysis Report", [
+        f"Driver teeth: {z1}", f"Driven teeth: {z2}", f"Ratio: {ratio:.4f}:1",
+        f"Input speed: {rpm:.2f} rpm", f"Output speed: {out_rpm:.2f} rpm",
+        f"Input power: {power:.3f} kW", f"Assumed efficiency: {eff:.2f}%",
+        f"Output torque: {tout:.3f} N·m", f"Centre distance: {center:.3f} mm",
+        "Schematic pitch circles only; tooth profile/contact ratio/bending and pitting strength are not analysed.",
+    ], graph_specs=[{"kind":"gear","title":"Gear pitch-circle layout","xlabel":"X (mm)","ylabel":"Y (mm)","circles":[(d1/2,0.0,"Driver"),(d2/2,center,"Driven")]}])
+    st.warning("Preliminary ideal gear-pair tool. Tooth strength, contact ratio, backlash, lubrication, bearing loads and applicable standards are not assessed.")
+
+
+# ---------- Thermal & welding ----------
+def thermal_module() -> None:
+    page_header("🌡️ Thermal & Welding Heat Simulation", "A simplified heat-source visualization for learning, not a welding procedure predictor.")
+    a, b, c = st.columns(3)
+    q = a.number_input("Heat input power (W)", 10.0, 100000.0, 1200.0, key="th_q")
+    alpha = b.number_input("Thermal diffusivity (mm²/s)", 0.01, 200.0, 12.0, key="th_a")
+    duration = c.number_input("Heating time (s)", 1.0, 3600.0, 60.0, key="th_t")
+    eta = st.slider("Effective heat fraction", 0.1, 1.0, 0.75, 0.05, key="th_eta")
+    xlim = st.slider("Field half-width (mm)", 10, 200, 60, key="th_x")
+    xs = np.linspace(-xlim, xlim, 81)
+    ys = np.linspace(-xlim, xlim, 81)
+    X, Y = np.meshgrid(xs, ys)
+    r2 = X ** 2 + Y ** 2
+    spread = max(2.0, math.sqrt(4.0 * alpha * duration))
+    amp = q * eta / (4.0 * math.pi * max(alpha, 0.01) * duration)
+    temp = 20.0 + amp * np.exp(-r2 / (spread ** 2)) * duration / 100.0
+    peak = float(temp.max())
+    metric_row([
+        ("Peak illustrative temperature", f"{peak:.1f} °C", "Model-dependent estimate"),
+        ("Diffusion length scale", f"{spread:.2f} mm", "sqrt(4 α t)"),
+        ("Effective heat input", f"{q * eta:.1f} W", "Power × heat fraction"),
+    ])
+    fig = go.Figure(go.Contour(x=xs, y=ys, z=temp, colorscale="Inferno", colorbar=dict(title="°C"),
+                               contours=dict(showlabels=True)))
+    fig.update_layout(title="Illustrative 2D heat field", xaxis_title="Distance x (mm)", yaxis_title="Distance y (mm)")
+    st.plotly_chart(chart_layout(fig, 430), use_container_width=True, config={"responsive": True, "displayModeBar": False})
+    times = np.linspace(1.0, duration, 80)
+    # Illustrative normalized rise toward the field's center value; not a transient heat-transfer solution.
+    center_rise_limit = q * eta / (4.0 * math.pi * alpha * 100.0)
+    rise_time = max(duration / 5.0, 1.0)
+    center_t = 20.0 + center_rise_limit * (1.0 - np.exp(-times / rise_time))
+    ft = go.Figure(go.Scatter(x=times, y=center_t, mode="lines", name="Illustrative center-point rise"))
+    ft.update_layout(title="Illustrative center-point temperature rise", xaxis_title="Time (s)", yaxis_title="Illustrative temperature (°C)")
+    st.plotly_chart(chart_layout(ft, 320), use_container_width=True, config={"responsive": True, "displayModeBar": False})
+    df = pd.DataFrame({"x_mm": X.ravel(), "y_mm": Y.ravel(), "illustrative_temperature_C": temp.ravel()})
+    downloads("thermal_simulation", df, "Thermal Simulation Report", [
+        f"Input power: {q:.2f} W", f"Effective heat fraction: {eta:.3f}",
+        f"Thermal diffusivity: {alpha:.4f} mm²/s", f"Heating time: {duration:.2f} s",
+        f"Illustrative peak temperature: {peak:.3f} °C",
+        "The Gaussian field and normalized center-point rise are illustrative teaching visuals, not a validated transient heat-transfer model.",
+    ], graph_specs=[{"kind":"heatmap","title":"Illustrative temperature field","xlabel":"X (mm)","ylabel":"Y (mm)","x":xs,"y":ys,"z":temp,"colorbar":"°C"},{"title":"Center-point temperature trend","xlabel":"Time (s)","ylabel":"Temperature (°C)","series":[{"x":times.tolist(),"y":center_t.tolist(),"label":"Center point"}]}], report_df=pd.DataFrame([{
+        "heat_input_W": q, "heat_fraction": eta, "thermal_diffusivity_mm2_s": alpha,
+        "heating_time_s": duration, "peak_illustrative_temperature_C": peak,
+        "diffusion_length_mm": spread, "effective_heat_input_W": q*eta,
+    }]))
+    st.warning("This simplified Gaussian field and normalized rise curve are not calibrated to a real weld, boundary conditions, density, heat capacity, material properties or process. Do not use them to select welding parameters or certify safety.")
+
+
+# ---------- Robotics ----------
+def robotics_module() -> None:
+    page_header("🦾 Robotics & Kinematics", "Two-link planar robot arm: endpoint position from joint angles, with pose export.")
+    a, b, c = st.columns(3)
+    L1 = a.number_input("Link 1 length (mm)", 10.0, 2000.0, 300.0, key="r_l1")
+    L2 = b.number_input("Link 2 length (mm)", 10.0, 2000.0, 220.0, key="r_l2")
+    t1 = c.slider("Joint 1 angle (°)", -180, 180, 35, key="r_t1")
+    t2 = st.slider("Joint 2 relative angle (°)", -180, 180, 55, key="r_t2")
+    x1, y1, x2, y2, reach = planar_two_link(float(L1), float(L2), float(t1), float(t2))
+    metric_row([
+        ("End-effector X", f"{x2:.2f} mm", "Base origin at (0, 0)"),
+        ("End-effector Y", f"{y2:.2f} mm", "Planar vertical coordinate"),
+        ("Reach from base", f"{reach:.2f} mm", "Endpoint distance"),
+    ])
+    fig = go.Figure()
+    fig.add_trace(go.Scatter(x=[0, x1, x2], y=[0, y1, y2], mode="lines+markers+text",
+                             text=["Base", "Joint 1", "Tool tip"], textposition="top center",
+                             line=dict(width=7), marker=dict(size=11), name="Robot arm"))
+    fig.add_shape(type="circle", x0=-(L1 + L2), y0=-(L1 + L2), x1=L1 + L2, y1=L1 + L2,
+                  line=dict(dash="dot", color="gray"))
+    fig.update_layout(title="Planar robot arm pose", xaxis_title="X (mm)", yaxis_title="Y (mm)",
+                      xaxis=dict(range=[-(L1 + L2) * 1.1, (L1 + L2) * 1.1]),
+                      yaxis=dict(range=[-(L1 + L2) * 1.1, (L1 + L2) * 1.1], scaleanchor="x", scaleratio=1))
+    st.plotly_chart(chart_layout(fig, 430), use_container_width=True, config={"responsive": True, "displayModeBar": False})
+    df = pd.DataFrame([{"link1_mm": L1, "link2_mm": L2, "joint1_deg": t1,
+                        "joint2_relative_deg": t2, "joint2_absolute_deg": t1 + t2,
+                        "end_effector_x_mm": x2, "end_effector_y_mm": y2, "reach_mm": reach}])
+    downloads("robot_kinematics", df, "Robot Kinematics Report", [
+        f"Link 1: {L1:.3f} mm", f"Link 2: {L2:.3f} mm", f"Joint 1 angle: {t1} degrees",
+        f"Joint 2 relative angle: {t2} degrees", f"End effector X: {x2:.3f} mm",
+        f"End effector Y: {y2:.3f} mm", f"Reach: {reach:.3f} mm",
+        "Planar forward kinematics only; dynamics, collision and inverse-kinematics constraints are not included.",
+    ], graph_specs=[{"kind":"robot","title":"Robot arm pose","xlabel":"X (mm)","ylabel":"Y (mm)","x":[0,x1,x2],"y":[0,y1,y2],"labels":["Base","Joint 1","Tool tip"]}])
+    st.info("Uses planar forward kinematics. Joint limits, collision detection, dynamics and actuator sizing are not included.")
+
+
+# ---------- Materials ----------
+def materials_module() -> None:
+    page_header("📈 Materials & Stress–Strain", "An idealized tensile stress–strain curve with elastic modulus and an illustrative post-yield response.")
+    a, b, c = st.columns(3)
+    E = a.number_input("Young's modulus (GPa)", 1.0, 500.0, 200.0, key="m_E")
+    ys = b.number_input("Yield strength (MPa)", 1.0, 3000.0, 250.0, key="m_yield")
+    uts = c.number_input("Ultimate strength (MPa)", 1.0, 5000.0, 450.0, key="m_uts")
+    elong = st.slider("Illustrative strain range (%)", 0.2, 30.0, 5.0, 0.2, key="m_strain")
+    if uts < ys:
+        st.warning("Ultimate strength is below yield strength. Adjust the inputs for a typical ductile-metal illustration.")
+    strain = np.linspace(0.0, elong / 100.0, 250)
+    e_mpa = E * 1000.0
+    ey = ys / e_mpa
+    stress = np.where(strain <= ey, e_mpa * strain,
+                      ys + (uts - ys) * np.minimum((strain - ey) / max(float(strain.max() - ey), 1e-9), 1.0))
+    sel_pct = st.slider("Selected engineering strain (%)", 0.0, float(elong), min(float(elong), 1.0), 0.1, key="m_selstrain")
+    sel = sel_pct / 100.0
+    selected_stress = float(np.interp(sel, strain, stress))
+    metric_row([
+        ("Young's modulus", f"{E:.2f} GPa", "Elastic slope"),
+        ("Yield strain estimate", f"{ey * 100:.3f}%", "Yield strength / modulus"),
+        ("Selected stress", f"{selected_stress:.2f} MPa", f"At {sel_pct:.2f}% strain"),
+    ])
+    fig = go.Figure()
+    fig.add_trace(go.Scatter(x=strain * 100, y=stress, mode="lines", name="Idealized material curve", line=dict(width=3)))
+    fig.add_trace(go.Scatter(x=[sel_pct], y=[selected_stress], mode="markers", name="Selected strain",
+                             marker=dict(size=12, symbol="diamond")))
+    fig.add_vline(x=ey * 100, line_dash="dash", annotation_text="Estimated yield strain")
+    fig.update_layout(title="Engineering stress–strain curve (idealized)", xaxis_title="Engineering strain (%)",
+                      yaxis_title="Engineering stress (MPa)", xaxis=dict(range=[0, float(elong)]))
+    st.plotly_chart(chart_layout(fig, 410), use_container_width=True, config={"responsive": True, "displayModeBar": False})
+    df = pd.DataFrame({"engineering_strain_fraction": strain, "engineering_strain_pct": strain * 100,
+                       "illustrative_stress_MPa": stress})
+    downloads("materials_stress_strain", df, "Materials Stress Strain Report", [
+        f"Young's modulus: {E:.3f} GPa", f"Yield strength: {ys:.3f} MPa",
+        f"Ultimate strength input: {uts:.3f} MPa", f"Estimated yield strain: {ey * 100:.5f}%",
+        f"Selected strain: {sel_pct:.4f}%", f"Illustrative selected stress: {selected_stress:.3f} MPa",
+        "Curve is a simplified teaching approximation, not experimental material data or a constitutive law.",
+    ], graph_specs=[{"title":"Engineering stress–strain curve","xlabel":"Strain (%)","ylabel":"Stress (MPa)","series":[{"x":(strain*100).tolist(),"y":stress.tolist(),"label":"Material curve"},{"x":[sel_pct],"y":[selected_stress],"label":"Selected strain"}]}], report_df=pd.DataFrame([{
+        "youngs_modulus_GPa": E, "yield_strength_MPa": ys, "ultimate_strength_input_MPa": uts,
+        "estimated_yield_strain_pct": ey*100, "selected_strain_pct": sel_pct,
+        "illustrative_selected_stress_MPa": selected_stress,
+    }]))
+    st.warning("The post-yield curve is an illustrative interpolation, not a validated material model. Use certified material data for engineering design.")
+
+
+# ---------- Beam & shaft basics ----------
+def beam_module() -> None:
+    page_header("📐 Beam & Shaft Basics", "A first-pass Euler–Bernoulli estimate for a simply supported solid round beam with a centered point load.")
+    a, b = st.columns(2)
+    load = a.number_input("Center point load (N)", min_value=0.0, value=500.0, step=50.0, key="bm_load")
+    span = b.number_input("Support span (mm)", min_value=1.0, value=500.0, step=10.0, key="bm_span")
+    diameter = a.number_input("Solid round diameter (mm)", min_value=1.0, value=20.0, step=1.0, key="bm_d")
+    modulus = b.number_input("Young's modulus (MPa)", min_value=1.0, value=200000.0, step=1000.0, key="bm_E")
+    try:
+        result = simply_supported_circular_beam(load, span, diameter, modulus)
+    except ValueError as exc:
+        st.error(str(exc))
+        return
+    metric_row([
+        ("Reaction at each support", f"{result['reaction_each_n']:.2f} N", "Symmetric center load"),
+        ("Maximum bending moment", f"{result['max_moment_nmm']:.2f} N·mm", "P × L / 4"),
+        ("Maximum bending stress", f"{result['max_bending_stress_mpa']:.2f} MPa", "Solid circular section"),
+        ("Mid-span deflection", f"{result['midspan_deflection_mm']:.4f} mm", "Small-deflection estimate"),
+    ])
+    x = np.linspace(0.0, span, 201)
+    moment = np.where(x <= span/2, load*x/2, load*(span-x)/2)
+    fig = go.Figure(go.Scatter(x=x, y=moment, mode="lines", name="Bending moment"))
+    fig.update_layout(title="Bending moment diagram", xaxis_title="Position along span (mm)", yaxis_title="Moment (N·mm)")
+    st.plotly_chart(chart_layout(fig, 330), use_container_width=True, config={"responsive": True, "displayModeBar": False})
+    df = pd.DataFrame([{"load_N": load, "span_mm": span, "solid_diameter_mm": diameter,
+                        "youngs_modulus_MPa": modulus, **result}])
+    downloads("beam_shaft", df, "Beam & Shaft Preliminary Report", [
+        f"Center point load: {load:.3f} N", f"Support span: {span:.3f} mm",
+        f"Solid round diameter: {diameter:.3f} mm", f"Young's modulus: {modulus:.3f} MPa",
+        f"Maximum bending stress: {result['max_bending_stress_mpa']:.3f} MPa",
+        f"Mid-span deflection: {result['midspan_deflection_mm']:.5f} mm",
+        "Assumes a simply supported, prismatic, solid circular beam, centered static point load, linear elasticity and small deflection.",
+        "Does not assess shear stress, fatigue, buckling, stress concentrations, safety factors, connections or design-code compliance.",
+    ], graph_specs=[{"title":"Bending moment diagram","xlabel":"Position (mm)","ylabel":"Moment (N·mm)",
+                     "series":[{"x":x.tolist(),"y":moment.tolist(),"label":"Bending moment"}]}])
+    st.warning("Educational preliminary estimate only. Check allowable stress, shear, fatigue, deflection limits, supports and applicable design standards before real use.")
+
+
+# ---------- Shaft combined loading ----------
+def shaft_module() -> None:
+    page_header("🔩 Shaft Torsion & Combined Loading", "Elastic estimate for a solid circular shaft under steady torque and bending moment.")
+    a, b, c = st.columns(3)
+    torque = a.number_input("Transmitted torque (N·m)", min_value=0.0, value=100.0, step=5.0, key="sh_t")
+    bending = b.number_input("Maximum bending moment (N·m)", min_value=0.0, value=50.0, step=5.0, key="sh_m")
+    diameter = c.number_input("Shaft diameter (mm)", min_value=1.0, value=30.0, step=1.0, key="sh_d")
+    length = a.number_input("Shaft length (mm)", min_value=0.0, value=1000.0, step=50.0, key="sh_l")
+    shear_g = b.number_input("Shear modulus G (MPa)", min_value=1.0, value=79300.0, step=1000.0, key="sh_g")
+    yield_strength = c.number_input("Material yield strength (MPa)", min_value=1.0, value=250.0, step=10.0, key="sh_y")
+    fos = st.number_input("Illustrative factor of safety", min_value=1.0, max_value=10.0, value=2.0, step=0.1, key="sh_fos")
+    try:
+        r = solid_shaft_combined_load(torque, bending, diameter, length, shear_g)
+    except ValueError as exc:
+        st.error(str(exc))
+        return
+    allowable = yield_strength / fos
+    utilization = r["von_mises_stress_mpa"] / allowable
+    metric_row([
+        ("Bending stress", f"{r['bending_stress_mpa']:.2f} MPa", "σ = 32M / πd³"),
+        ("Torsional shear", f"{r['torsional_shear_mpa']:.2f} MPa", "τ = 16T / πd³"),
+        ("Von Mises stress", f"{r['von_mises_stress_mpa']:.2f} MPa", "√(σ² + 3τ²)"),
+        ("Angle of twist", f"{r['angle_of_twist_deg']:.3f}°", "θ = TL / GJ"),
+    ])
+    if utilization <= 1.0:
+        st.success(f"Preliminary static utilization: {utilization*100:.1f}% of the illustrative allowable stress ({allowable:.1f} MPa).")
+    else:
+        st.warning(f"Von Mises estimate exceeds the illustrative allowable stress by {(utilization-1)*100:.1f}%. Increase section size or review the design assumptions.")
+    st.caption("Assumes a prismatic solid circular shaft, elastic isotropic material and maximum bending moment/torque acting at the same section. Keyways, shoulders, stress concentrations, fatigue, deflection limits and code factors are not included.")
+    df = pd.DataFrame([{"torque_Nm": torque, "bending_moment_Nm": bending, "diameter_mm": diameter,
+                        "length_mm": length, "shear_modulus_MPa": shear_g, "yield_strength_MPa": yield_strength,
+                        "factor_of_safety_assumed": fos, **r, "illustrative_allowable_MPa": allowable,
+                        "utilization_ratio": utilization}])
+    downloads("shaft_combined_loading", df, "Shaft Combined Loading Report", [
+        "Bending stress: σb = 32M/(πd³)", "Torsional shear: τ = 16T/(πd³)",
+        "Von Mises estimate: σvm = sqrt(σb² + 3τ²)", "Angle of twist: θ = TL/(GJ), J = πd⁴/32",
+        f"Illustrative allowable = yield strength / assumed factor of safety = {allowable:.3f} MPa",
+        "Preliminary static estimate only; not a fatigue, shaft critical-speed, bearing, key, or code design check.",
+    ])
+
+
+# ---------- Single-degree-of-freedom vibration ----------
+def vibration_module() -> None:
+    page_header("〰️ Vibration & Dynamics", "Time-domain free-response simulation of a linear single-degree-of-freedom mass–spring–damper system.")
+    a, b, c = st.columns(3)
+    mass = a.number_input("Mass (kg)", min_value=0.001, value=10.0, step=0.5, key="vb_m")
+    stiffness = b.number_input("Spring stiffness (N/m)", min_value=0.1, value=4000.0, step=100.0, key="vb_k")
+    damping = c.number_input("Viscous damping c (N·s/m)", min_value=0.0, value=80.0, step=5.0, key="vb_c")
+    x0 = a.number_input("Initial displacement (mm)", value=10.0, step=1.0, key="vb_x0")
+    v0 = b.number_input("Initial velocity (mm/s)", value=0.0, step=10.0, key="vb_v0")
+    duration = c.number_input("Simulation duration (s)", min_value=0.1, value=3.0, step=0.5, key="vb_t")
+    times = np.linspace(0.0, float(duration), 401)
+    try:
+        r = sdof_free_vibration(mass, stiffness, damping, x0, v0, times)
+    except ValueError as exc:
+        st.error(str(exc))
+        return
+    response = np.asarray(r["displacement_mm"], dtype=float)
+    metric_row([
+        ("Natural frequency", f"{r['natural_frequency_hz']:.3f} Hz", f"ωn = {r['natural_frequency_rad_s']:.3f} rad/s"),
+        ("Critical damping", f"{r['critical_damping_ns_m']:.2f} N·s/m", "cc = 2√(km)"),
+        ("Damping ratio", f"{r['damping_ratio']:.4f}", "ζ = c/cc"),
+        ("Response regime", str(r["damping_regime"]), "Based on damping ratio"),
+    ])
+    if r["damping_regime"] == "Underdamped":
+        st.caption(f"Damped natural frequency: {r['damped_frequency_hz']:.3f} Hz ({r['damped_frequency_rad_s']:.3f} rad/s)")
+    fig = go.Figure(go.Scatter(x=times, y=response, mode="lines", name="Displacement response"))
+    fig.add_hline(y=0, line_dash="dot", line_color="gray")
+    fig.update_layout(title="Free vibration displacement response", xaxis_title="Time (s)", yaxis_title="Displacement (mm)")
+    st.plotly_chart(chart_layout(fig, 390), use_container_width=True, config={"responsive": True, "displayModeBar": False})
+    st.caption("Exact closed-form solution of the ideal linear SDOF model for the specified initial displacement and velocity. Real assemblies may require measured damping, multiple modes, nonlinear stiffness and forcing inputs.")
+    df = pd.DataFrame({"time_s": times, "displacement_mm": response})
+    summary = pd.DataFrame([{"mass_kg": mass, "stiffness_N_m": stiffness, "damping_Ns_m": damping,
+                             "initial_displacement_mm": x0, "initial_velocity_mm_s": v0,
+                             "natural_frequency_Hz": r["natural_frequency_hz"],
+                             "critical_damping_Ns_m": r["critical_damping_ns_m"],
+                             "damping_ratio": r["damping_ratio"], "regime": r["damping_regime"],
+                             "peak_abs_displacement_in_window_mm": float(np.max(np.abs(response)))}])
+    downloads("sdof_vibration", df, "SDOF Vibration Report", [
+        "Equation: m x¨ + c x˙ + kx = 0", "Natural frequency: ωn = sqrt(k/m)",
+        "Critical damping: cc = 2sqrt(km); damping ratio: ζ = c/cc",
+        "Underdamped damped frequency: ωd = ωn sqrt(1 − ζ²). The response uses the closed-form initial-condition solution for all three damping regimes.",
+        f"Peak absolute displacement in the selected time window: {float(np.max(np.abs(response))):.5f} mm",
+        "Model assumes one degree of freedom, linear spring, viscous damping and no continuing external force. CSV contains the complete time history.",
+    ], report_df=summary)
+
+
+# ---------- Thin-walled pressure vessel ----------
+def pressure_vessel_module() -> None:
+    page_header("🛢️ Pressure Vessel Basics", "Membrane-stress estimate for an internally pressurized, closed-ended thin cylindrical shell.")
+    a, b, c = st.columns(3)
+    pressure = a.number_input("Internal gauge pressure (MPa)", min_value=0.0, value=1.0, step=0.1, key="pv_p")
+    diameter = b.number_input("Inside diameter (mm)", min_value=1.0, value=500.0, step=10.0, key="pv_d")
+    thickness = c.number_input("Wall thickness (mm)", min_value=0.1, value=10.0, step=0.5, key="pv_t")
+    yield_strength = a.number_input("Material yield strength (MPa)", min_value=1.0, value=250.0, step=10.0, key="pv_y")
+    fos = b.number_input("Illustrative factor of safety", min_value=1.0, max_value=10.0, value=2.0, step=0.1, key="pv_fos")
+    try:
+        r = thin_wall_cylinder_stress(pressure, diameter, thickness)
+    except ValueError as exc:
+        st.error(str(exc))
+        return
+    allowable = yield_strength / fos
+    utilization = r["hoop_stress_mpa"] / allowable
+    metric_row([
+        ("Hoop stress", f"{r['hoop_stress_mpa']:.2f} MPa", "σh = pD/(2t)"),
+        ("Longitudinal stress", f"{r['longitudinal_stress_mpa']:.2f} MPa", "σL = pD/(4t)"),
+        ("D/t ratio", f"{r['diameter_to_thickness_ratio']:.1f}", "Thin-wall screening ratio"),
+        ("Max in-plane shear", f"{r['max_in_plane_shear_mpa']:.2f} MPa", "(σh − σL)/2"),
+    ])
+    if r["diameter_to_thickness_ratio"] < 20:
+        st.warning("D/t is below 20: the thin-wall membrane approximation is not appropriate for this screening case. Use thick-cylinder analysis and a qualified code design.")
+    else:
+        st.success("D/t meets the common preliminary thin-wall screening ratio (≥20); this does not establish code compliance.")
+    if utilization > 1.0:
+        st.warning("The hoop-stress estimate exceeds the illustrative yield-strength/factor-of-safety allowable.")
+    st.caption("Closed-end cylinder; internal gauge pressure; uniform membrane stress through the wall; linear elastic material. Excludes heads, nozzles, openings, weld efficiency, corrosion allowance, external pressure, thermal stress, fatigue and code-specific design rules.")
+    df = pd.DataFrame([{"pressure_MPa": pressure, "inside_diameter_mm": diameter, "wall_thickness_mm": thickness,
+                        "yield_strength_MPa": yield_strength, "assumed_factor_of_safety": fos, **r,
+                        "illustrative_allowable_MPa": allowable, "hoop_utilization_ratio": utilization}])
+    downloads("thin_wall_pressure_vessel", df, "Thin-Wall Pressure Vessel Report", [
+        "Hoop stress: σh = pD/(2t) = pr/t", "Longitudinal stress (closed ends): σL = pD/(4t) = pr/(2t)",
+        "Maximum in-plane shear: τmax = (σh − σL)/2", f"Illustrative allowable stress = Sy/FOS = {allowable:.3f} MPa",
+        "This educational membrane-stress check is not a pressure-vessel design calculation or a substitute for ASME BPVC Section VIII or the jurisdictional code.",
+    ])
+
+
+# ---------- Pipe flow and pump estimate ----------
+def pipe_flow_module() -> None:
+    page_header("💧 Pipe Flow & Pump Sizing", "Steady incompressible flow estimate using Reynolds number, Darcy friction, major/minor losses and pump efficiency.")
+    a, b, c = st.columns(3)
+    flow = a.number_input("Flow rate (L/min)", min_value=0.001, value=50.0, step=5.0, key="pf_q")
+    diameter = b.number_input("Pipe internal diameter (mm)", min_value=1.0, value=50.0, step=1.0, key="pf_d")
+    length = c.number_input("Straight pipe length (m)", min_value=0.0, value=100.0, step=5.0, key="pf_l")
+    roughness = a.number_input("Absolute roughness (mm)", min_value=0.0, value=0.045, step=0.005, format="%.4f", key="pf_eps")
+    density = b.number_input("Fluid density (kg/m³)", min_value=0.1, value=998.0, step=10.0, key="pf_rho")
+    viscosity = c.number_input("Dynamic viscosity (mPa·s)", min_value=0.001, value=1.0, step=0.1, key="pf_mu")
+    minor_k = a.number_input("Total minor-loss coefficient K", min_value=0.0, value=2.0, step=0.5, key="pf_k")
+    efficiency = b.number_input("Pump efficiency (%)", min_value=1.0, max_value=100.0, value=70.0, step=1.0, key="pf_eta")
+    try:
+        r = pipe_flow_calculation(flow, diameter, length, roughness, density, viscosity, minor_k, efficiency)
+    except (ValueError, RuntimeError) as exc:
+        st.error(f"Pipe-flow calculation stopped: {exc}")
+        return
+    metric_row([
+        ("Mean velocity", f"{r['velocity_m_s']:.3f} m/s", "Q / pipe area"),
+        ("Reynolds number", f"{r['reynolds_number']:.0f}", str(r["flow_regime"])),
+        ("Darcy friction factor", f"{r['darcy_friction_factor']:.5f}", "Darcy, not Fanning"),
+        ("Total head loss", f"{r['total_head_loss_m']:.3f} m", "Major + minor losses"),
+    ])
+    c1, c2, c3 = st.columns(3)
+    c1.metric("Pressure drop", f"{r['pressure_drop_kpa']:.2f} kPa")
+    c2.metric("Hydraulic power", f"{r['hydraulic_power_w']:.1f} W")
+    c3.metric("Estimated pump input", f"{r['estimated_pump_input_power_w']:.1f} W")
+    if str(r["flow_regime"]).startswith("Transitional"):
+        st.warning("Reynolds number is in the transition range. Friction factor is interpolated and should be treated as an uncertain estimate.")
+    st.caption("Assumes steady, fully developed, incompressible flow in a constant-diameter circular pipe; constant fluid properties; Darcy-Weisbach losses; supplied total K for fittings. Pump input excludes motor/drive losses beyond the entered pump efficiency.")
+    df = pd.DataFrame([{"flow_L_min": flow, "diameter_mm": diameter, "length_m": length,
+                        "roughness_mm": roughness, "density_kg_m3": density,
+                        "dynamic_viscosity_mPa_s": viscosity, "minor_loss_K": minor_k,
+                        "pump_efficiency_pct": efficiency, **r}])
+    downloads("pipe_flow_pump_estimate", df, "Pipe Flow & Pump Estimate Report", [
+        "Reynolds number: Re = ρVD/μ", "Darcy-Weisbach major loss: hf = f(L/D)(V²/2g)",
+        "Minor loss: hm = K(V²/2g)", "Pressure drop: Δp = ρg(hf + hm)",
+        "Hydraulic power: Ph = ρgQH; estimated pump input = Ph/η",
+        "Darcy friction factor: 64/Re for laminar flow; Colebrook-White for turbulent flow; smooth interpolation through the transition band.",
+    ])
+
+
+# ---------- Existing online AI tutor ----------
+def tutor_module() -> None:
+    page_header("🤖 AI Engineering Tutor", "Existing online Groq chatbot. The API key is read securely from Streamlit Secrets.")
+    st.session_state.setdefault("tutor_messages", [])
+    question = st.text_area("Your engineering question",
+                            placeholder="e.g., Explain Hooke's law and show a worked example.", height=110,
+                            key="tutor_question")
+    if st.button("Ask AI tutor", type="primary", use_container_width=True):
+        if not question.strip():
+            st.warning("Enter a question first.")
+        else:
+            try:
+                key = st.secrets["GROQ_API_KEY"]
+                response = requests.post(
+                    "https://api.groq.com/openai/v1/chat/completions",
+                    headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json"},
+                    json={"model": "openai/gpt-oss-120b", "messages": [
+                        {"role": "system", "content": (
+                            "You are a careful mechanical engineering tutor. For numerical problems, list the known data, "
+                            "state the governing equation, substitute values with consistent units, calculate the result, "
+                            "and perform a dimensional and reasonableness check. Show the final answer with units. "
+                            "State assumptions and distinguish exact theoretical relations from empirical estimates. "
+                            "Identify when a recognized code or standard must be checked. Never claim an educational "
+                            "estimate certifies a real design or replaces a licensed engineer's review.")},
+                        *st.session_state.tutor_messages[-12:],
+                        {"role": "user", "content": question.strip()},
+                    ], "temperature": 0.2, "max_completion_tokens": 3000,
+                         "reasoning_effort": "medium", "include_reasoning": False},
+                    timeout=60,
+                )
+                response.raise_for_status()
+                answer_text = response.json()["choices"][0]["message"]["content"].strip()
+                if not answer_text:
+                    raise ValueError("Empty AI response")
+                st.session_state.tutor_messages.extend([
+                    {"role": "user", "content": question.strip()},
+                    {"role": "assistant", "content": answer_text},
+                ])
+                st.session_state.chat_answer = answer_text
+                st.session_state.chat_last_question = question.strip()
+            except KeyError:
+                st.error("GROQ_API_KEY is missing from Streamlit Secrets. Add it in the app's Secrets settings; never paste the key into this code.")
+            except requests.HTTPError as exc:
+                status = exc.response.status_code if exc.response is not None else "unknown"
+                detail = ""
+                if exc.response is not None:
+                    try:
+                        detail = str(exc.response.json().get("error", {}).get("message", ""))
+                    except (ValueError, AttributeError):
+                        detail = ""
+                st.error(f"Groq returned HTTP {status}. {detail or 'Check the API key, model access and provider limits.'}")
+            except requests.RequestException:
+                st.error("Could not connect to Groq. Check connectivity or provider availability and try again.")
+            except (ValueError, TypeError, IndexError, KeyError):
+                st.error("The AI response had an unexpected format. Please try again.")
+    answer = st.session_state.get("chat_answer", "")
+    if st.session_state.tutor_messages:
+        head, clear_col = st.columns([4, 1])
+        head.markdown("### Conversation")
+        if clear_col.button("Clear", use_container_width=True, key="clear_tutor"):
+            st.session_state.tutor_messages = []
+            st.session_state.chat_answer = ""
+            st.rerun()
+        for message in st.session_state.tutor_messages[-12:]:
+            with st.chat_message("user" if message["role"] == "user" else "assistant"):
+                st.markdown(message["content"])
+    if answer:
+        tutor_lines = [
+            "MechLab Studio — AI Engineering Tutor",
+            f"Question: {st.session_state.get('chat_last_question', question.strip()) or 'Earlier question in this session'}",
+            "AI tutor answer:",
+            *answer.splitlines(),
+            "AI-generated educational guidance may contain errors. Verify equations, units, and engineering decisions against trusted references.",
+        ]
+        tutor_report_df = pd.DataFrame([{
+            "Question": st.session_state.get("chat_last_question", question.strip()) or "Earlier question in this session"
+        }])
+        tutor_pdf = _make_pdf("AI Engineering Tutor Report", tutor_report_df, tutor_lines)
+        if tutor_pdf:
+            st.download_button(
+                "⬇️ Download tutor answer as PDF",
+                data=tutor_pdf,
+                file_name="ai_engineering_tutor_report.pdf",
+                mime="application/pdf",
+                use_container_width=True,
+            )
+    st.caption("This module uses the configured online API; it is not a local model. Use is subject to provider availability and limits.")
+
+
+# ---------- Navigation ----------
+def set_module(module_name: str) -> None:
+    # Called as a Streamlit callback before the next full rerun.
+    st.session_state.active_module = module_name
+    st.session_state.nav_radio = module_name
+
+
+st.session_state.setdefault("active_module", "Home")
+st.session_state.setdefault("chat_answer", "")
+st.session_state.setdefault("nav_radio", "Home")
+
+nav_title, nav_picker = st.columns([1.2, 2.8])
+with nav_title:
+    st.markdown("### ⚙️ MechLab Studio")
+    st.caption("Mechanical engineering workbench")
+choices = ["Home"] + list(MODULES.keys())
+if st.session_state.active_module not in choices:
+    st.session_state.active_module = "Home"
+if st.session_state.nav_radio not in choices:
+    st.session_state.nav_radio = st.session_state.active_module
+with nav_picker:
+    selected = st.selectbox(
+        "Workspace",
+        choices,
+        index=choices.index(st.session_state.active_module),
+        format_func=lambda x: "🏠 Home" if x == "Home" else f"{MODULES[x][0]} {x}",
+        key="nav_radio",
+    )
+st.session_state.active_module = selected
+st.divider()
+
+active = st.session_state.active_module
+if active == "Home":
+    st.markdown(
+        '<div class="hero"><h1>MechLab Studio</h1><p>One engineering module at a time. Calculate, simulate, inspect results, and export your readings.</p></div>',
+        unsafe_allow_html=True,
+    )
+    st.markdown("### Choose a workspace")
+    st.write("Select a module. Only that workspace opens, keeping its calculations, graphs, simulation and downloads together.")
+    names = list(MODULES.keys())
+    for start in range(0, len(names), 2):
+        cols = st.columns(2, gap="large")
+        for col, name in zip(cols, names[start:start + 2]):
+            emoji, desc = MODULES[name]
+            with col:
+                st.markdown(f'<div class="module-card"><h3>{emoji} {name}</h3><p>{desc}</p></div>', unsafe_allow_html=True)
+                st.button(
+                    f"Open {name} →", key=f"open_{name}", use_container_width=True,
+                    on_click=set_module, args=(name,),
+                )
+    st.divider()
+    st.markdown("### Project notes")
+    c1, c2, c3 = st.columns(3)
+    c1.metric("Workspaces", str(len(MODULES)), "One active workspace at a time")
+    c2.metric("Export formats", "Calculation PDF + CSV", "Readings and calculated results; no graphs")
+    c3.metric("AI connection", "Groq API", "Key stored in Streamlit Secrets")
+    st.caption("Engineering results are educational preliminary estimates. Validate against authoritative references and applicable standards before real-world use.")
+elif active == "Spring Design":
+    spring_module()
+elif active == "Gear & Machine Design":
+    gear_module()
+elif active == "Thermal & Welding":
+    thermal_module()
+elif active == "Robotics & Kinematics":
+    robotics_module()
+elif active == "Materials & Stress–Strain":
+    materials_module()
+elif active == "Beam & Shaft Basics":
+    beam_module()
+elif active == "Shaft Torsion & Combined Loading":
+    shaft_module()
+elif active == "Vibration & Dynamics":
+    vibration_module()
+elif active == "Pressure Vessel Basics":
+    pressure_vessel_module()
+elif active == "Pipe Flow & Pump Sizing":
+    pipe_flow_module()
+elif active == "AI Engineering Tutor":
+    tutor_module()
